@@ -25,13 +25,14 @@ class Config(BasicConfig):
         self.lamda = 0.95
         self.dual_clip = 3.0
         self.val_coef = 0.5         # 价值损失系数
-        self.log_std_init = -0.5    # log_std的初始值
+        self.log_std_init = 0.0      # log_std的初始值
         #self.lr = Schedule("linear_schedule", init = 5e-4, final = 0.0)                  # 5e-4
         self.lr = 3e-4
         self.ent_coef = 0.0         # 熵损失系数
         self.grad_clip = 0.5        # 梯度裁剪
         self.load_model = False     # 是否加载模型
         self.seed = 42
+        self.test_eps = 5
 
 
 class Schedule:
@@ -155,4 +156,5 @@ class PPO(ModelLoader):
 
 if __name__ == '__main__':
     BenchMark.train(PPO, Config)
+    # BenchMark.test(PPO, Config)
 

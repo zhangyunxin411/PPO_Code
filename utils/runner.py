@@ -172,7 +172,7 @@ def train(env, agent, cfg):
         if (agent.learn_step + 1) % cfg.eval_freq == 0:
             tools = {'writer': writer}
             evaluate(env, agent, cfg, tools)
-        # 每更新10次保存一次模型
+        # 每更新50次保存一次模型
         if (agent.learn_step + 1) % cfg.save_freq == 0:
             agent.save_model()    
             
@@ -201,11 +201,15 @@ def evaluate(env, agent, cfg, tools):
 
 def test(env, agent, cfg):
     logger.info('Start test!')
-    agent.load_model()
+    if not hasattr(agent, "state_norm"):
+        agent.state_norm = Normalization(shape=env.observation_space.shape)
+        logger.debug('Add state normalization!')
+    agent.load_model()      # 将保存好的模型参数导入到刚刚构建的网络和优化器对象
     for i in range(cfg.test_eps):
         ep_reward, ep_step, done = 0.0, 0, False
         state, _ = env.reset(seed=np.random.randint(1, 2**31 - 1))
-        state = agent.state_norm(state, update=False)
+        # state = agent.state_norm(state, update=False)
+        # state, _ = env.reset(seed=cfg.seed)
         while not done:
             ep_step += 1
             action = agent.evaluate(state)
@@ -214,7 +218,7 @@ def test(env, agent, cfg):
             state = next_state
             ep_reward += reward
             done = terminated or truncated
-        logger.info(f'Episode:{i + 1}/{cfg.train_eps}  Reward:{ep_reward:.0f}  Step:{ep_step:.0f}')
+        logger.info(f'Episode:{i + 1}/{cfg.test_eps}  Reward:{ep_reward:.0f}  Step:{ep_step:.0f}')
     logger.info('Finish test!')
     env.close()
     
@@ -226,7 +230,6 @@ class BenchMark:
         cfg = config()
         env = make_env(cfg)     # must be called before agent is created
         agent = algo(cfg, {"actor" : [64, 64], "critic" : [64, 64]})
-        print(agent.net)
         train(env, agent, cfg)
     
     @logger.catch(reraise=True) 
@@ -235,7 +238,7 @@ class BenchMark:
         cfg = config()
         cfg.render_mode = 'human'
         env = make_env(cfg)
-        agent = algo(cfg)
+        agent = algo(cfg, {"actor" : [64, 64], "critic" : [64, 64]})
         test(env, agent, cfg)
         
     

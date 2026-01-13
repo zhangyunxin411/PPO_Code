@@ -158,9 +158,10 @@ class ModelLoader:
         state = {}
         for key, value in self.__dict__.items():
             exclude_keys = ['state_buffer', 'cfg', 'memory']
-            if key in exclude_keys:
+            if key in exclude_keys:     # 跳过这几个属性不检查
                 continue
             logger.debug(f"Save {key}")
+            # 构建一个字典state包含网络和优化器的可学习参数
             if hasattr(value, 'state_dict'):
                 state[f'{key}_state_dict'] = value.state_dict()
             else:
@@ -171,16 +172,16 @@ class ModelLoader:
 
     def load_model(self):
         with logger.catch(message="Model loading failed."):
-            checkpoint = torch.load(self.cfg.save_path, map_location=self.cfg.device)
+            checkpoint = torch.load(self.cfg.save_path, map_location=self.cfg.device, weights_only=False)
             for key, value in checkpoint.items():
                 exclude_keys = ['state_buffer', 'cfg', 'memory']
                 if key in exclude_keys:
                     continue
                 logger.debug(f"Load {key}")
-                if key.endswith('_state_dict'):
-                    attr_name = key.replace('_state_dict', '')
+                if key.endswith('_state_dict'):     # 匹配后缀是否相同
+                    attr_name = key.replace('_state_dict', '')      # 去掉后缀
                     if hasattr(self, attr_name):
-                        getattr(self, attr_name).load_state_dict(value)
+                        getattr(self, attr_name).load_state_dict(value)     # 由于只保存网络参数，因此将参数导入到网络和优化器
                 else:
                     setattr(self, key, value)
             logger.info(f"Load model： {self.cfg.save_path}")
