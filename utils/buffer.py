@@ -1,6 +1,101 @@
 import torch
 import numpy as np
 
+class ReplayBuffer_LSTM:
+    def __init__(self, cfg):
+        self.states = []
+        self.actions = []
+        self.old_log_probs = []
+        self.gaes = []
+        self.returns = []
+        self.hidden_states = []
+
+        self.rewards = []
+        self.values = []
+        self.terminateds = []
+        self.dones = []
+
+        self.next_value = None
+
+        self.seq_len = cfg.lstm_cfg.seq_len
+        self.num_seq = cfg.lstm_cfg.num_seq
+        self.n_state = cfg.n_states
+        self.n_action = cfg.n_actions
+        self.cfg = cfg
+
+    
+    def clear(self):
+        self.states.clear()
+        self.actions.clear()
+        self.old_log_probs.clear()
+        self.gaes.clear()
+        self.returns.clear()
+        self.hidden_states.clear()
+
+        self.rewards.clear()
+        self.values.clear()
+        self.terminateds.clear()
+        self.dones.clear()
+
+    def store(self, state, action, reward, log_prob, value, terminated, done):
+        self.states.append(state)
+        self.actions.append(action)
+        self.old_log_probs.append(log_prob)
+        self.rewards.append(reward)
+        self.values.append(value)
+        self.terminateds.append(terminated)
+        self.dones.append(done)
+
+    def size(self):
+        return len(self.states)
+    
+    def sample(self):
+        # 在转成tensor之前先计算优势估计和return
+        adv, v_target = self.compute_advantage()
+
+        states = torch.tensor(np.array(self.states), dtype=torch.float32).to(self.cfg.device)
+        actions = torch.tensor(np.array(self.actions), dtype=torch.float32).to(self.cfg.device)
+        adv = torch.tensor(adv, dtype=torch.float32).to(self.cfg.device)
+        v_target = torch.tensor(v_target, dtype=torch.float32).to(self.cfg.device)
+        old_log_probs = torch.tensor(np.array(self.old_log_probs), dtype=torch.float32).to(self.cfg.device)
+        hidden_states = torch.tensor(np.array(self.hidden_states), dtype=torch.float32).to(self.cfg.device)
+
+        # 将收集到的数据reshape成(num_seq, seq_len)
+        if self.cfg.env_continuous:
+            states = states.view(self.num_seq, self.seq_len, self.n_state)
+            actions = actions.view(self.num_seq, self.seq_len, self.n_action)
+            old_log_probs = old_log_probs.view(self.num_seq, self.seq_len)
+            adv = adv.view(self.num_seq, self.seq_len)
+            v_target = v_target.view(self.num_seq, self.seq_len)
+        else:
+            states = states.view(self.num_seq, self.seq_len, self.n_state)
+            actions = actions.view(self.num_seq, self.seq_len).type(torch.long)
+            old_log_probs = old_log_probs.view(self.num_seq, self.seq_len)
+            adv = adv.view(self.num_seq, self.seq_len)
+            v_target = v_target.view(self.num_seq, self.seq_len)
+
+        self.samples = states, actions, old_log_probs, adv, v_target, hidden_states
+        
+        return self.samples
+    
+    def compute_advantage(self):
+        rewards = np.array(self.rewards)
+        dones = np.array(self.dones)
+        values = np.array(self.values + [self.next_value])
+        terminated = np.array(self.terminateds)
+        
+        gae = np.zeros_like(rewards)
+        last_gae = 0
+        for t in reversed(range(len(rewards))):
+            td_error = rewards[t] + self.cfg.gamma * values[t + 1] * (1 - terminated[t]) - values[t]
+            gae[t] = td_error + self.cfg.gamma * self.cfg.lamda * (1 - dones[t]) * last_gae
+            last_gae = gae[t]
+        returns = gae + values[:-1]
+        gae = (gae - gae.mean()) / (gae.std() + 1e-8)           # 优势估计标准化
+            
+        return gae, returns
+
+
 class ReplayBuffer_on_policy:
     def __init__(self, cfg):
         self.cfg = cfg

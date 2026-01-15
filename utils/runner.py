@@ -130,7 +130,7 @@ def train(env, agent, cfg):
         if cfg.on_policy:
             action, log_prob, value = agent.choose_action(state)
         else:
-            action = agent.choose_action(state)        
+            action = agent.choose_action(state)
         
         while agent.memory.size() < cfg.batch_size:
             next_state, reward, terminated, truncated, info = env.step(action)
@@ -221,8 +221,108 @@ def test(env, agent, cfg):
         logger.info(f'Episode:{i + 1}/{cfg.test_eps}  Reward:{ep_reward:.0f}  Step:{ep_step:.0f}')
     logger.info('Finish test!')
     env.close()
+
+def train_lstm(env, agent, cfg):
+    logger.info('Start training!')
     
+    if cfg.load_model:
+        agent.load_model()
     
+    if not hasattr(agent, "state_norm"):
+        agent.state_norm = Normalization(shape=env.observation_space.shape) # 状态标准化
+        logger.debug('Add state normalization!')
+    if not hasattr(agent, "reward_scaler"):
+        agent.reward_scaler = RewardScaling(shape=1, gamma=cfg.gamma)       # 奖励缩放
+        logger.debug('Add reward scaling!')
+
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    # 创建SummaryWriter，用于tensorboard添加记录数据
+    writer = SummaryWriter(f'./exp/{cfg.algo_name}_{cfg.env_name.replace("/", "-")}_{timestamp}')
+    # 显示超参数
+    cfg.show()
+
+    # 初始化 hidden_state (batch_size, hidden_dim)
+    hidden_state = torch.zeros(1, cfg.lstm_cfg.hidden_dim * cfg.lstm_cfg.chunk_num, device=cfg.device)
+    
+    while (agent.learn_step * cfg.batch_size) < cfg.total_step:
+        ep_reward = 0.0
+        agent.reward_scaler.reset()
+
+        # 复位环境
+        state, _ = env.reset(seed=cfg.seed)  
+        state = agent.state_norm(state)         # (17, )
+        
+        while agent.memory.size() < cfg.batch_size:
+
+            action, log_prob, value, next_hidden_state = agent.choose_action(state, hidden_state)
+
+            # hidden_state的形状为(batch_size, 2*hidden_dim)
+            
+            assert hidden_state.dim() == 2, "hidden_state's dim should be 2"
+            agent.memory.hidden_states.append(hidden_state.squeeze(0).cpu().numpy())
+
+            next_state, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            ep_reward += reward             # 累积奖励，不打折扣
+
+            reward = agent.reward_scaler(reward)[0]     # 缩放奖励
+            next_state = agent.state_norm(next_state)
+
+            agent.memory.store(state, action, reward, log_prob, value, terminated, done)
+
+            if done:
+                next_state, _ = env.reset(seed=cfg.seed)
+                next_state = agent.state_norm(next_state)
+            if terminated:
+                next_hidden_state = torch.zeros(1, cfg.lstm_cfg.hidden_dim * cfg.lstm_cfg.chunk_num, device=cfg.device)
+        
+            state = next_state
+            hidden_state = next_hidden_state
+
+        _, _, next_value, _ = agent.choose_action(state, hidden_state)
+        agent.memory.next_value = next_value
+        # update
+        monitors = agent.lstm_update()
+
+        log_monitors(writer, monitors, agent, 'train', agent.learn_step)
+        # TODO：监控A网络的std，但是输出是多个动作，所以不好处理
+        if cfg.env_continuous:
+            log_monitors(writer, {'std_mean': torch.mean(torch.exp(agent.net.log_std)).item()}, agent, 'train', agent.learn_step)
+
+        log_monitors(writer, {'reward': ep_reward}, agent, 'train', agent.learn_step)
+        logger.info(f'Step:{agent.learn_step*cfg.batch_size}  Episode:{agent.learn_step}  Reward:{ep_reward:.0f}')
+
+        # 每更新10次评估一次
+        if (agent.learn_step + 1) % cfg.eval_freq == 0:
+            tools = {'writer': writer}
+            evaluate_lstm(env, agent, cfg, tools)
+        # 每更新50次保存一次模型
+        if (agent.learn_step + 1) % cfg.save_freq == 0:
+            agent.save_model()    
+            
+    logger.info('Finish training!')
+    agent.save_model()
+    env.close()
+    writer.close()
+
+# 评估当前的策略，纯贪婪，不探索，选择概率最大的动作，以奖励累加（不打折）作为标准
+def evaluate_lstm(env, agent, cfg, tools):
+    ep_reward, ep_step, done = 0.0, 0, False
+    state, _ = env.reset(seed=cfg.seed)
+    writer = tools['writer']
+    state = agent.state_norm(state, update=False)
+    hidden_state = torch.zeros(1, cfg.lstm_cfg.hidden_dim * cfg.lstm_cfg.chunk_num, device=cfg.device)
+    while not done:
+        ep_step += 1
+        action, hidden_state = agent.evaluate(state, hidden_state)      # 选动作贪婪
+        next_state, reward, terminated, truncated, _ = env.step(action)
+        next_state = agent.state_norm(next_state, update=False)
+        state = next_state
+        ep_reward += reward
+        done = terminated or truncated
+    log_monitors(writer, {'reward': ep_reward}, agent, 'eval', agent.learn_step)   # 可能出现2条episode才会更新一次的状况
+
+
 class BenchMark:
     @logger.catch(reraise=True)
     @staticmethod
@@ -238,8 +338,16 @@ class BenchMark:
         cfg = config()
         cfg.render_mode = 'human'
         env = make_env(cfg)
-        agent = algo(cfg, {"actor" : [64, 64], "critic" : [64, 64]})
+        agent = algo(cfg, net_arch = {"actor" : [64, 64], "critic" : [64, 64]})
         test(env, agent, cfg)
+
+    @logger.catch(reraise=True)
+    @staticmethod
+    def train_lstm(algo, config):
+        cfg = config()
+        env = make_env(cfg)
+        agent = algo(cfg, hidden_dim = cfg.lstm_cfg.hidden_dim)
+        train_lstm(env, agent, cfg)
         
     
  

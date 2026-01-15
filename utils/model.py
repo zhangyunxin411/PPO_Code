@@ -24,71 +24,6 @@ def initialize_weights(layer, init_type='kaiming', nonlinearity='leaky_relu'):
     return layer
 
 
-# 全连接层
-class MLP(nn.Module):
-    def __init__(self,
-                 dim_list,
-                 activation=nn.PReLU(),
-                 last_act=False,
-                 use_norm=False,
-                 linear=nn.Linear,
-                 *args, **kwargs
-                 ):
-        super(MLP, self).__init__()
-        assert dim_list, "Dim list can't be empty!"
-        layers = []
-        for i in range(len(dim_list) - 1):
-            layer = initialize_weights(linear(dim_list[i], dim_list[i + 1], *args, **kwargs))
-            layers.append(layer)
-            if i < len(dim_list) - 2:
-                if use_norm:
-                    layers.append(nn.LayerNorm(dim_list[i + 1]))
-                layers.append(activation)
-        if last_act:
-            if use_norm:
-                layers.append(nn.LayerNorm(dim_list[-1]))
-            layers.append(activation)
-        # 将上述的网络连接起来
-        self.mlp = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.mlp(x)
-
-
-# 一种兼顾宽度和深度的全连接层，提取信息效率更高
-class PSCN(nn.Module):
-    def __init__(self, input_dim, output_dim, depth=4, linear=nn.Linear):
-        super(PSCN, self).__init__()
-        min_dim = 2 ** (depth - 1)
-        assert depth >= 1, "depth must be at least 1"
-        assert output_dim >= min_dim, f"output_dim must be >= {min_dim} for depth {depth}"
-        assert output_dim % min_dim == 0, f"output_dim must be divisible by {min_dim} for depth {depth}"
-        
-        self.layers = nn.ModuleList()
-        self.output_dim = output_dim
-        in_dim, out_dim = input_dim, output_dim
-        
-        for i in range(depth):
-            self.layers.append(MLP([in_dim, out_dim], last_act=True, linear=linear))
-            in_dim = out_dim // 2
-            out_dim //= 2 
-
-    def forward(self, x):
-        out_parts = []
-        
-        for i, layer in enumerate(self.layers):
-            x = layer(x)
-            if i < len(self.layers) - 1:
-                split_size = int(self.output_dim // (2 ** (i + 1)))
-                part, x = torch.split(x, [split_size, split_size], dim=-1)  # 按照参数中的列表大小，划分成指定数目的块
-                out_parts.append(part)
-            else:
-                out_parts.append(x)
-
-        out = torch.cat(out_parts, dim=-1)
-        return out
-
-
 class MlpExtractor(nn.Module):
     def __init__(self, net_arch : dict, input_dim, activation_fn, device):
         super(MlpExtractor, self).__init__()
@@ -119,31 +54,83 @@ class MlpExtractor(nn.Module):
         return self.actor_net(states), self.critic_net(states)
 
 
+class LSTM(nn.Module):
+    def __init__(self, cfg, hidden_dim, *args, **kwargs):
+        super(LSTM, self).__init__()
+        self.input_dim = cfg.n_states
+        self.hidden_dim = hidden_dim
+        self.mini_batch = cfg.mini_batch
+        self.device = cfg.device
+
+        self.lstm = nn.LSTM(self.input_dim, self.hidden_dim, batch_first=True, device=cfg.device, *args, **kwargs)
+        # 初始化网络参数，权重使用正交初始化，偏置初始化为0
+        for name, param in self.lstm.named_parameters():
+            if "bias" in name:
+                nn.init.constant_(param, 0)
+            elif "weight" in name:
+                nn.init.orthogonal_(param, 1.0)
+        self.chunk_size = cfg.lstm_cfg.chunk_num
+
+    # 注意：hidden_states是隐藏状态和细胞状态的合并
+    def forward(self, input, hidden_states):
+        # input形状为(batch_size, seq_len, input_size)
+        # hidden_states为h+c,形状为(hidden_layer_num, mini_batch, 2*hidden_dim)
+        if hidden_states is None:
+            hidden_states = torch.zeros(1, self.mini_batch, self.chunk_size*self.hidden_dim, device=self.device)
+        assert hidden_states.dim() == 3, f"hidden_states.dim()={hidden_states.dim()}, expected dim=3"
+        assert input.dim() == 3, f"input.dim()={input.dim()}, expected dim=3"
+        h_in = torch.chunk(hidden_states, self.chunk_size, dim=-1)   # 包括隐藏状态h和细胞状态c，将其且分开，输出(h,c)
+        h_in = tuple(h.contiguous() for h in h_in)  # 转换成连续内存布局，提高性能
+        output, new_hidden_state = self.lstm(input, h_in)
+        new_hidden_state = torch.cat(new_hidden_state, dim=-1)  # 再将新的h和c拼接成一个张量
+        new_hidden_state = new_hidden_state.squeeze(0)  # 去掉hidden_layer_num维度，变成(mini_batch, 2*hidden_dim)
+        return output, new_hidden_state
+
+
 class ActorCritic(nn.Module):
-    def __init__(self, cfg, net_arch):
+    def __init__(self, cfg, net_arch = None, hidden_dim = None):
         super(ActorCritic, self).__init__()
-        # self.fc_head = PSCN(cfg.n_states, 256, depth=4)
-        # self.critic_fc = MLP([256, 64, 1])
-        # self.actor_fc = MLP([256, 64, cfg.n_actions])
-        self.mlp_extractor = MlpExtractor(net_arch, cfg.n_states, nn.Tanh, cfg.device)
-        self.critic_fc = nn.Linear(self.mlp_extractor.critic_last_dim, 1)
-        self.actor_fc = nn.Linear(self.mlp_extractor.actor_last_dim, cfg.n_actions)
-        self.env_continuous = cfg.env_continuous
+        self.cfg = cfg
+        if cfg.net == 'MLP':
+            assert net_arch!=None, "if use MLP, net_arch can't be None"
+            self.mlp_extractor = MlpExtractor(net_arch, cfg.n_states, nn.Tanh, cfg.device)
+            critic_dim = self.mlp_extractor.critic_last_dim
+            actor_dim = self.mlp_extractor.actor_last_dim
+        elif cfg.net == 'LSTM':
+            assert hidden_dim!=None, "if use LSTM, hidden_dim can't be None"
+            self.lstm = LSTM(cfg, hidden_dim)
+            critic_dim = hidden_dim
+            actor_dim = hidden_dim
+
+        self.critic_fc = nn.Linear(critic_dim, 1)
+        self.actor_fc = nn.Linear(actor_dim, cfg.n_actions)
         if cfg.env_continuous:      # 标准差为状态无关的，可随梯度更新的参数
             self.log_std = nn.Parameter(torch.ones(cfg.n_actions) * cfg.log_std_init, requires_grad=True)
 
     # 输入标准化后的状态，输出动作分布，价值
-    def forward(self, s):
-        actor_out, critic_out = self.mlp_extractor(s)         # s--PSCN-->x
-        if self.env_continuous:
-            mean = 1.0 * torch.tanh(self.actor_fc(actor_out))
+    def forward(self, s, hidden_state=None):
+        if self.cfg.net == 'MLP':
+            actor_in, critic_in = self.mlp_extractor(s)
+        elif self.cfg.net == 'LSTM':
+            lstm_out, new_hidden_state = self.lstm(s, hidden_state)
+            actor_in = lstm_out
+            critic_in = lstm_out
+
+        if self.cfg.env_continuous:
+            mean = 1.0 * torch.tanh(self.actor_fc(actor_in))
+            if self.cfg.net == 'LSTM':
+                mean = mean.view(-1, self.cfg.n_actions)
             std = torch.exp(self.log_std.clamp(min=-5, max=1e-4))
             prob = Normal(mean, std)
         else : 
-            prob = F.softmax(self.actor_fc(actor_out), dim=-1)
+            prob = F.softmax(self.actor_fc(actor_in), dim=-1)
             prob = Categorical(prob)
-        value = self.critic_fc(critic_out)
-        return prob, value
+        value = self.critic_fc(critic_in)
+
+        if self.cfg.net == 'MLP':
+            return prob, value
+        elif self.cfg.net == 'LSTM':
+            return prob, value, new_hidden_state
 
 
 # 管理模型加载与存储
