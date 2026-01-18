@@ -306,6 +306,7 @@ def train_lstm(env, agent, cfg):
     writer.close()
 
 # 评估当前的策略，纯贪婪，不探索，选择概率最大的动作，以奖励累加（不打折）作为标准
+# 注意评估的时候，会在truncated或terminated条件下停止，最长步长为1000步，所以相较于训练时的2048步，奖励值会低一半
 def evaluate_lstm(env, agent, cfg, tools):
     ep_reward, ep_step, done = 0.0, 0, False
     state, _ = env.reset(seed=cfg.seed)

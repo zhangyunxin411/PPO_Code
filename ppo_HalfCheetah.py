@@ -27,9 +27,10 @@ class Config(BasicConfig):
         self.dual_clip = 3.0
         self.val_coef = 0.5         # 价值损失系数
         self.log_std_init = -0.5      # log_std的初始值
-        self.lr = Schedule("linear_schedule", init = 5e-4, final = 0.0)                  # 5e-4
         # self.lr = 3e-4
+        self.lr = Schedule("cosine_schedule", init = 1e-3, final = 0.0)                  # 5e-4
         self.ent_coef = 0.0         # 熵损失系数
+        # self.ent_coef = Schedule("linear_schedule", init = 0.01, final = 0.0)
         self.grad_clip = 0.5        # 梯度裁剪
         self.load_model = False     # 是否加载模型
         self.seed = 42
@@ -55,9 +56,14 @@ class Schedule:
     def __call__(self, progress):
         if self.schedual == "linear_schedule" :
             return self.linear_schedule(progress)
+        elif self.schedual == "cosine_schedule":
+            return self.cosine_schedule(progress)
 
     def linear_schedule(self, progress):
         return self.init + (self.final - self.init) * progress
+    
+    def cosine_schedule(self, progress):
+        return self.final + 0.5 * (self.init - self.final) * (1 + np.cos(np.pi * progress))
 
 
 class PPO(ModelLoader):
@@ -124,11 +130,18 @@ class PPO(ModelLoader):
             action = prob.mean.tolist()[0]            # 选择概率最大的那个动作，纯贪婪
         else:
             action = prob.mode.tolist()[0]            # 选择众数，也就是概率最大的动作
-        return action, new_hidden_state
+        
+        if self.cfg.net == 'MLP':
+            return action
+        elif self.cfg.net == 'LSTM':
+            return action, new_hidden_state
     
     def update_lr(self, progress):
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = self.cfg.lr(progress)
+
+    def update_ent_coef(self, progress):
+        return self.cfg.ent_coef(progress)
     
     def update(self):
         states, actions, old_probs, adv, v_target = self.memory.sample()
@@ -203,6 +216,10 @@ class PPO(ModelLoader):
         progress = (self.learn_step * self.cfg.batch_size) / self.cfg.total_step
         if isinstance(self.cfg.lr, Schedule):
             self.update_lr(progress)
+        if isinstance(self.cfg.ent_coef, Schedule):
+            ent_coef = self.update_ent_coef(progress)
+        else:
+            ent_coef = self.cfg.ent_coef
         
         init_hidden_states = hidden_states[::self.cfg.lstm_cfg.seq_len]  # 每个序列的初始隐藏状态
         assert len(init_hidden_states) == self.cfg.lstm_cfg.num_seq, "len(init_hidden_states) not equal num_seq"
@@ -257,8 +274,6 @@ class PPO(ModelLoader):
                     min_surr
                 ))
 
-                # TODO:熵系数衰减
-
                 assert v_target_flat.shape == value_flat.shape, \
                     f"v_target_flat.shape={v_target_flat.shape}, but value_flat.shape={value_flat.shape}"
                 value_loss = F.mse_loss(v_target_flat, value_flat)
@@ -266,7 +281,7 @@ class PPO(ModelLoader):
                     entropy_loss = -actor_prob.entropy().sum(dim=1).mean()
                 else:
                     entropy_loss = -actor_prob.entropy().mean()
-                loss = clip_loss + self.cfg.val_coef * value_loss + self.cfg.ent_coef * entropy_loss
+                loss = clip_loss + self.cfg.val_coef * value_loss + ent_coef * entropy_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -288,6 +303,7 @@ class PPO(ModelLoader):
             'entropy_loss': losses[3] / self.cfg.epochs / (self.cfg.batch_size // self.cfg.mini_batch),
             'advantage': adv.mean().item(),
             'lr': self.optimizer.param_groups[0]['lr'],
+            'ent_coef' : self.cfg.ent_coef if not isinstance(self.cfg.ent_coef, Schedule) else ent_coef,
         }
 
 if __name__ == '__main__':

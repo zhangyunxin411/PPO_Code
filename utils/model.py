@@ -64,11 +64,11 @@ class LSTM(nn.Module):
 
         self.lstm = nn.LSTM(self.input_dim, self.hidden_dim, batch_first=True, device=cfg.device, *args, **kwargs)
         # 初始化网络参数，权重使用正交初始化，偏置初始化为0
-        for name, param in self.lstm.named_parameters():
+        """for name, param in self.lstm.named_parameters():
             if "bias" in name:
                 nn.init.constant_(param, 0)
             elif "weight" in name:
-                nn.init.orthogonal_(param, 1.0)
+                nn.init.orthogonal_(param, 1.0)"""
         self.chunk_size = cfg.lstm_cfg.chunk_num
 
     # 注意：hidden_states是隐藏状态和细胞状态的合并
